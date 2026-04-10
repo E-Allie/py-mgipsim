@@ -44,6 +44,12 @@ class SolverBase(ABC):
                 self.controller = Controllers.HCL0.controller.Controller(self.scenario_instance)
                 self.model.inputs.uInsulin.sampled_signal[:, 0] = UnitConversion.insulin.Uhr_to_mUmin(np.asarray([x.demographic_info.basal_rate for x in self.controller.controllers]))
                 self.model.preprocessing()
+            case Controllers.Oref0.controller.Controller.name:
+                self.controller = Controllers.Oref0.controller.Controller(self.scenario_instance)
+                self.model.inputs.uInsulin.sampled_signal[:, 0] = UnitConversion.insulin.Uhr_to_mUmin(
+                    np.asarray(self.scenario_instance.patient.demographic_info.basal)
+                )
+                self.model.preprocessing()
             case _:  # Default case
                 raise Exception("Undefined controller, Add it to the ModelSolver class.")
 
