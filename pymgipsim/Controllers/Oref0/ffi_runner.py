@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 import logging
 import math
 import os
@@ -8,28 +7,6 @@ from typing import Any
 
 _logger = logging.getLogger(__name__)
 
-
-@contextlib.contextmanager
-def _suppress_fd2():
-    """Redirect OS-level stderr (fd 2) to /dev/null for the duration of the block.
-
-    Rust's eprintln! writes directly to fd 2, bypassing Python's sys.stderr.
-    The subprocess path silently discards this output via the pipe; the FFI
-    path must suppress it explicitly to avoid flooding the terminal with
-    algorithm debug lines on every 5-minute cycle.
-
-    Real error information is returned in result.error (not stderr), so
-    suppressing fd 2 does not hide actionable errors.
-    """
-    devnull_fd = os.open(os.devnull, os.O_WRONLY)
-    saved_fd2 = os.dup(2)
-    try:
-        os.dup2(devnull_fd, 2)
-        yield
-    finally:
-        os.dup2(saved_fd2, 2)
-        os.close(saved_fd2)
-        os.close(devnull_fd)
 
 _oref0_ffi = None
 
@@ -47,11 +24,14 @@ def _get_ffi():
     if _oref0_ffi is None:
         try:
             import oref0_ffi
-            if not hasattr(oref0_ffi, "ffi_determine_basal") or not hasattr(oref0_ffi, "ffi_calculate_iob"):
-                visible_attrs = sorted(a for a in dir(oref0_ffi) if not a.startswith("_"))[:10]
+            required = [
+                "ffi_determine_basal", "ffi_calculate_iob", "ffi_calculate_meal",
+                "ffi_detect_sensitivity", "ffi_autotune_prep", "ffi_autotune_core",
+            ]
+            missing = [f for f in required if not hasattr(oref0_ffi, f)]
+            if missing:
                 raise RuntimeError(
-                    f"oref0_ffi wheel is malformed: missing expected functions. "
-                    f"Found attributes: {visible_attrs}. "
+                    f"oref0_ffi wheel is missing: {missing}. "
                     f"Rebuild with: cd oref0-rs/crates/oref0-ffi && maturin develop --release"
                 )
             _oref0_ffi = oref0_ffi
@@ -189,14 +169,14 @@ def _build_last_temp(ffi, lt: dict):
     )
 
 
-def _build_iob_data_input(ffi, iob: dict):
+def _build_iob_data_entry(ffi, iob: dict):
     zwt_raw = iob.get("iobWithZeroTemp")
     zwt = _build_iob_with_zero_temp(ffi, zwt_raw) if zwt_raw is not None else None
 
     lt_raw = iob.get("lastTemp")
     lt = _build_last_temp(ffi, lt_raw) if lt_raw is not None else None
 
-    entry = ffi.FfiIobData(
+    return ffi.FfiIobData(
         iob=_opt_float(iob.get("iob")),
         activity=_opt_float(iob.get("activity")),
         bolussnooze=_opt_float(iob.get("bolussnooze")),
@@ -208,7 +188,14 @@ def _build_iob_data_input(ffi, iob: dict):
         last_temp=lt,
         time=iob.get("time"),
     )
-    return ffi.FfiIobDataInput.SINGLE(entry)
+
+
+def _build_iob_data_input(ffi, iob: dict):
+    return ffi.FfiIobDataInput.SINGLE(_build_iob_data_entry(ffi, iob))
+
+
+def _build_iob_data_array(ffi, iob_list: list):
+    return ffi.FfiIobDataInput.ARRAY([_build_iob_data_entry(ffi, e) for e in iob_list])
 
 
 def _build_meal_data(ffi, meal: dict):
@@ -274,17 +261,37 @@ def _build_pump_event(ffi, entry: dict):
     return ffi.FfiPumpEvent.OTHER()
 
 
-def _build_profile(ffi, pd: dict):
-    basal_entries = []
-    for entry in pd.get("basalprofile", []):
-        basal_entries.append(ffi.FfiBasalProfileEntry(
-            minutes=int(entry.get("minutes", 0)),
-            rate=float(entry.get("rate", 0.0)),
-            start=str(entry.get("start", "00:00:00")),
-            i=int(entry.get("i", 0)),
-        ))
+def _build_basal_entries(ffi, entries: list) -> list:
+    return [ffi.FfiBasalProfileEntry(
+        minutes=int(e.get("minutes", 0)),
+        rate=float(e.get("rate", 0.0)),
+        start=str(e.get("start", "00:00:00")),
+        i=int(e.get("i", 0)),
+    ) for e in entries]
 
-    # ProfileBuilder uses "carb_ratios" (snake_case); test vectors use "carbRatios" (camelCase)
+
+def _build_isf_profile(ffi, isf_raw: dict | None):
+    if not isf_raw:
+        return None
+    sensitivities = [ffi.FfiIsfSensitivity(
+        end_offset=_opt_int(s.get("endOffset")),
+        offset=_opt_int(s.get("offset")),
+        x=_opt_int(s.get("x")),
+        sensitivity=float(s.get("sensitivity", 0.0)),
+        start=str(s.get("start", "00:00:00")),
+        i=_opt_int(s.get("i")),
+    ) for s in isf_raw.get("sensitivities", [])]
+    return ffi.FfiIsfProfile(
+        first=_opt_int(isf_raw.get("first")),
+        sensitivities=sensitivities,
+        user_preferred_units=isf_raw.get("user_preferred_units"),
+        units=isf_raw.get("units"),
+    )
+
+
+def _build_profile(ffi, pd: dict):
+    basal_entries = _build_basal_entries(ffi, pd.get("basalprofile", []))
+
     carb_ratios = None
     cr_raw = pd.get("carb_ratios") or pd.get("carbRatios")
     if cr_raw:
@@ -303,27 +310,7 @@ def _build_profile(ffi, pd: dict):
             units=cr_raw.get("units"),
         )
 
-    isf_profile = None
-    isf_raw = pd.get("isfProfile")
-    if isf_raw:
-        sensitivities = []
-        for entry in isf_raw.get("sensitivities", []):
-            sensitivities.append(ffi.FfiIsfSensitivity(
-                end_offset=_opt_int(entry.get("endOffset")),
-                offset=_opt_int(entry.get("offset")),
-                x=_opt_int(entry.get("x")),
-                sensitivity=float(entry.get("sensitivity", 0.0)),
-                start=str(entry.get("start", "00:00:00")),
-                i=_opt_int(entry.get("i")),
-            ))
-        isf_profile = ffi.FfiIsfProfile(
-            first=_opt_int(isf_raw.get("first")),
-            sensitivities=sensitivities,
-            user_preferred_units=isf_raw.get("user_preferred_units"),
-            units=isf_raw.get("units"),
-        )
-
-    # ProfileBuilder uses "bg_targets" (snake_case); test vectors use "bgTargets" (camelCase)
+    isf_profile = _build_isf_profile(ffi, pd.get("isfProfile"))
     bg_targets = None
     bt_raw = pd.get("bg_targets") or pd.get("bgTargets")
     if bt_raw:
@@ -547,34 +534,243 @@ def _determine_basal_output_to_dict(result) -> dict:
     return d
 
 
+def _build_glucose_entry(ffi, entry: dict):
+    return ffi.FfiGlucoseEntry(
+        date=int(entry.get("date", 0)),
+        date_string=entry.get("dateString"),
+        sgv=_opt_float(entry.get("sgv")),
+        device=entry.get("device"),
+        entry_type=entry.get("type"),
+        glucose=_opt_float(entry.get("glucose")),
+        noise=_opt_float(entry.get("noise")),
+        direction=entry.get("direction"),
+        filtered=_opt_float(entry.get("filtered")),
+        unfiltered=_opt_float(entry.get("unfiltered")),
+        rssi=_opt_float(entry.get("rssi")),
+        raw=_opt_float(entry.get("raw")),
+        from_raw=entry.get("fromRaw"),
+        display_time=entry.get("display_time"),
+        mbg=_opt_float(entry.get("mbg")),
+    )
+
+
+def _build_carb_entry(ffi, entry: dict):
+    return ffi.FfiCarbEntry(
+        carbs=_opt_float(entry.get("carbs")),
+        created_at=entry.get("created_at"),
+        entered_by=entry.get("enteredBy"),
+    )
+
+
+def _build_temp_target(ffi, entry: dict):
+    return ffi.FfiTempTarget(
+        created_at=entry.get("created_at"),
+        duration=_opt_float(entry.get("duration")),
+        target_bottom=_opt_float(entry.get("targetBottom")),
+        target_top=_opt_float(entry.get("targetTop")),
+    )
+
+
+def _build_autotune_profile(ffi, p: dict):
+    return ffi.FfiAutotuneProfile(
+        dia=float(p.get("dia", 0.0)),
+        curve=str(p.get("curve", "")),
+        use_custom_peak_time=bool(p.get("useCustomPeakTime", False)),
+        insulin_peak_time=float(p.get("insulinPeakTime", 75.0)),
+        carb_ratio=float(p.get("carb_ratio", 0.0)),
+        basalprofile=_build_basal_entries(ffi, p.get("basalprofile", [])),
+        isf_profile=_build_isf_profile(ffi, p.get("isfProfile")),
+        autosens_max=_opt_float(p.get("autosens_max")),
+        autosens_min=_opt_float(p.get("autosens_min")),
+        autotune_isf_adjustment_fraction=_opt_float(p.get("autotune_isf_adjustmentFraction")),
+        min_5m_carbimpact=float(p.get("min_5m_carbimpact", 0.0)),
+        sens=_opt_float(p.get("sens")),
+        csf=_opt_float(p.get("csf")),
+    )
+
+
+def _meal_total_result_to_dict(result) -> dict:
+    return {
+        "carbs": result.carbs,
+        "nsCarbs": result.ns_carbs,
+        "bwCarbs": result.bw_carbs,
+        "journalCarbs": result.journal_carbs,
+        "mealCOB": result.meal_cob,
+        "currentDeviation": result.current_deviation,
+        "maxDeviation": result.max_deviation,
+        "minDeviation": result.min_deviation,
+        "slopeFromMaxDeviation": result.slope_from_max_deviation,
+        "slopeFromMinDeviation": result.slope_from_min_deviation,
+        "allDeviations": result.all_deviations,
+        "lastCarbTime": result.last_carb_time,
+        "bwFound": result.bw_found,
+    }
+
+
+def _autosens_result_to_dict(result) -> dict:
+    return {"ratio": result.ratio, "newisf": result.newisf}
+
+
+def _autotune_output_to_dict(result) -> dict:
+    basalprofile = []
+    for entry in result.basalprofile:
+        d = {
+            "minutes": entry.minutes,
+            "rate": entry.rate,
+            "start": entry.start,
+            "i": entry.i,
+        }
+        if entry.untuned is not None:
+            d["untuned"] = entry.untuned
+        basalprofile.append(d)
+
+    isf_profile = {
+        "sensitivities": [
+            {"sensitivity": s.sensitivity, "start": s.start}
+            for s in result.isf_profile.sensitivities
+        ],
+    }
+    if result.isf_profile.units is not None:
+        isf_profile["units"] = result.isf_profile.units
+
+    return {
+        "dia": result.dia,
+        "curve": result.curve,
+        "useCustomPeakTime": result.use_custom_peak_time,
+        "insulinPeakTime": result.insulin_peak_time,
+        "carb_ratio": result.carb_ratio,
+        "basalprofile": basalprofile,
+        "isfProfile": isf_profile,
+        "sens": result.sens,
+        "csf": result.csf,
+    }
+
+
 class FfiRunner:
     """Drop-in for SubprocessRunner using in-process oref0_ffi calls instead of subprocesses."""
+
+    def __init__(self):
+        self._ffi = _get_ffi()
+        self._session = None
+        self._pushed_history_len: int = 0
+        self._glucose_initialized: bool = False
+        self._glucose_maxlen: int = 288
+        # Cache fd descriptors for stderr suppression (Rust eprintln! writes
+        # to fd 2 directly). Saves 4 syscalls per cycle vs opening/closing
+        # each time.
+        self._devnull_fd: int = os.open(os.devnull, os.O_WRONLY)
+        self._real_fd2: int = os.dup(2)
+
+    def update_profile(self, profile: dict) -> None:
+        """Push an updated profile to the session (e.g. after autotune)."""
+        if self._session is not None:
+            self._session.update_profile(_build_profile(self._ffi, profile))
+
+    def run_cycle(
+        self,
+        pump_history: list,
+        glucose: list,
+        carb_history: list | None,
+        profile: dict,
+        clock: str,
+        currenttemp: dict,
+        basalprofile: list,
+        microbolus: bool,
+        enable_autosens: bool,
+        enable_meal: bool,
+    ) -> dict:
+        """Run one full oref0 cycle via the Rust session object.
+
+        Returns dict with 'iob', 'meal', 'autosens', 'basal' keys.
+        """
+        ffi = self._ffi
+
+        if self._session is None:
+            self._session = ffi.FfiSession(
+                _build_profile(ffi, profile),
+                _build_basal_entries(ffi, basalprofile),
+            )
+
+        # build_pump_history reverses to newest-first, so new events appear
+        # at the front. Push only those (~2-3 per cycle); the session
+        # prepends them to maintain newest-first order.
+        new_count = len(pump_history) - self._pushed_history_len
+        if new_count > 0:
+            self._session.push_pump_events(
+                [_build_pump_event(ffi, e) for e in pump_history[:new_count]]
+            )
+            self._pushed_history_len = len(pump_history)
+
+        # Incremental glucose: first call does full set_glucose (warmup data),
+        # then each subsequent cycle pushes only the 1 new reading at front.
+        if self._glucose_initialized:
+            if glucose:
+                self._session.push_glucose(
+                    _build_glucose_entry(ffi, glucose[0]), self._glucose_maxlen,
+                )
+        elif glucose:
+            self._session.set_glucose(
+                [_build_glucose_entry(ffi, e) for e in glucose]
+            )
+            self._glucose_initialized = True
+
+        # Carb history (small list, full replace is fine)
+        if carb_history:
+            self._session.set_carb_history(
+                [_build_carb_entry(ffi, e) for e in carb_history]
+            )
+
+        # Suppress Rust eprintln! output (fd 2) during the FFI call.
+        # Cached fds avoid 4 syscalls/cycle vs the context-manager approach.
+        os.dup2(self._devnull_fd, 2)
+        try:
+            result = self._session.run_cycle(
+                clock=clock,
+                currenttemp=_build_current_temp(ffi, currenttemp),
+                microbolus=microbolus,
+                run_autosens=enable_autosens,
+                run_meal=enable_meal,
+            )
+        finally:
+            os.dup2(self._real_fd2, 2)
+
+        return {
+            'iob': _iob_entry_to_dict(result.iob) if result.iob else {
+                "iob": 0.0, "activity": 0.0, "bolussnooze": 0.0,
+            },
+            'meal': _meal_total_result_to_dict(result.meal) if result.meal else None,
+            'autosens': _autosens_result_to_dict(result.autosens) if result.autosens else None,
+            'basal': _determine_basal_output_to_dict(result.basal) if result.basal else None,
+        }
+
+    def _call_ffi(self, fn, **kwargs):
+        """Call an FFI function with stderr suppressed via cached fd descriptors."""
+        os.dup2(self._devnull_fd, 2)
+        try:
+            return fn(**kwargs)
+        finally:
+            os.dup2(self._real_fd2, 2)
 
     def calculate_iob(
         self,
         pump_history: list,
         profile: dict,
         clock: str,
-    ) -> dict | None:
-        ffi = _get_ffi()
+    ) -> list | None:
+        ffi = self._ffi
         try:
             inputs = _build_history_inputs(ffi, pump_history, profile, clock)
-            with _suppress_fd2():
-                entries = ffi.ffi_calculate_iob(inputs=inputs, current_iob_only=False)
+            entries = self._call_ffi(ffi.ffi_calculate_iob, inputs=inputs, current_iob_only=False)
             if not entries:
                 return None
-            return _iob_entry_to_dict(entries[0])
+            return [_iob_entry_to_dict(e) for e in entries]
         except Exception as e:
-            _logger.warning(
-                "FfiRunner.calculate_iob failed: %s: %s. "
-                "Returning None.",
-                type(e).__name__, e,
-            )
+            _logger.warning("FfiRunner.calculate_iob failed: %s: %s", type(e).__name__, e)
             return None
 
     def determine_basal(
         self,
-        iob_data: dict,
+        iob_data: list,
         currenttemp: dict,
         glucose: list,
         profile: dict,
@@ -583,38 +779,128 @@ class FfiRunner:
         microbolus: bool = False,
         autosens_data: dict | None = None,
     ) -> dict | None:
-        ffi = _get_ffi()
+        ffi = self._ffi
         try:
             gs_dict = _get_last_glucose(glucose)
             if gs_dict is None:
                 return None
 
-            gs = _build_glucose_status(ffi, gs_dict)
-            ct = _build_current_temp(ffi, currenttemp)
-            iob = _build_iob_data_input(ffi, iob_data)
-            prof = _build_profile(ffi, profile)
-            meal = _build_meal_data(ffi, meal_data if meal_data is not None else {})
-            autosens = _build_autosens(ffi, autosens_data) if autosens_data else None
-
-            with _suppress_fd2():
-                result = ffi.ffi_determine_basal(
-                    glucose_status=gs,
-                    currenttemp=ct,
-                    iob_data=iob,
-                    profile=prof,
-                    autosens_data=autosens,
-                    meal_data=meal,
-                    micro_bolus_allowed=microbolus,
-                    reservoir_data=None,
-                    current_time=clock,
-                )
+            result = self._call_ffi(
+                ffi.ffi_determine_basal,
+                glucose_status=_build_glucose_status(ffi, gs_dict),
+                currenttemp=_build_current_temp(ffi, currenttemp),
+                iob_data=_build_iob_data_array(ffi, iob_data),
+                profile=_build_profile(ffi, profile),
+                autosens_data=_build_autosens(ffi, autosens_data) if autosens_data else None,
+                meal_data=_build_meal_data(ffi, meal_data if meal_data is not None else {}),
+                micro_bolus_allowed=microbolus,
+                reservoir_data=None,
+                current_time=clock,
+            )
             return _determine_basal_output_to_dict(result)
         except Exception as e:
-            _logger.warning(
-                "FfiRunner.determine_basal failed: %s: %s. "
-                "Returning None.",
-                type(e).__name__, e,
+            _logger.warning("FfiRunner.determine_basal failed: %s: %s", type(e).__name__, e)
+            return None
+
+    def calculate_meal(
+        self,
+        pump_history: list,
+        profile: dict,
+        clock: str,
+        glucose: list,
+        basalprofile: list,
+        carb_history: list | None = None,
+    ) -> dict | None:
+        ffi = self._ffi
+        try:
+            result = self._call_ffi(
+                ffi.ffi_calculate_meal,
+                history=[_build_pump_event(ffi, e) for e in pump_history],
+                carbs=[_build_carb_entry(ffi, e) for e in (carb_history or [])],
+                clock=clock,
+                profile=_build_profile(ffi, profile),
+                glucose=[_build_glucose_entry(ffi, e) for e in glucose],
+                basalprofile=_build_basal_entries(ffi, basalprofile),
             )
+            return _meal_total_result_to_dict(result)
+        except Exception as e:
+            _logger.warning("FfiRunner.calculate_meal failed: %s: %s", type(e).__name__, e)
+            return None
+
+    def detect_sensitivity(
+        self,
+        glucose: list,
+        pump_history: list,
+        isf: dict,
+        basalprofile: list,
+        profile: dict,
+        carb_history: list | None = None,
+    ) -> dict | None:
+        ffi = self._ffi
+        try:
+            result = self._call_ffi(
+                ffi.ffi_detect_sensitivity,
+                glucose=[_build_glucose_entry(ffi, e) for e in glucose],
+                history_inputs=_build_history_inputs(ffi, pump_history, profile, ""),
+                basalprofile=_build_basal_entries(ffi, basalprofile),
+                carbs=[_build_carb_entry(ffi, e) for e in (carb_history or [])],
+                temptargets=[],
+                retrospective=False,
+                deviations=None,
+            )
+            if result is None:
+                return {"ratio": 1}
+            return _autosens_result_to_dict(result)
+        except Exception as e:
+            _logger.warning("FfiRunner.detect_sensitivity failed: %s: %s", type(e).__name__, e)
+            return None
+
+    def autotune_prep(
+        self,
+        pump_history: list,
+        profile: dict,
+        glucose: list,
+        pumpprofile: dict,
+        carb_history: list | None = None,
+    ) -> dict | None:
+        import json
+        ffi = self._ffi
+        try:
+            json_str = self._call_ffi(
+                ffi.ffi_autotune_prep,
+                history=[_build_pump_event(ffi, e) for e in pump_history],
+                carbs=[_build_carb_entry(ffi, e) for e in (carb_history or [])],
+                profile=_build_profile(ffi, profile),
+                pumpprofile=_build_profile(ffi, pumpprofile),
+                glucose=[_build_glucose_entry(ffi, e) for e in glucose],
+                categorize_uam_as_basal=None,
+                tune_insulin_curve=None,
+            )
+            return json.loads(json_str)
+        except Exception as e:
+            _logger.warning("FfiRunner.autotune_prep failed: %s: %s", type(e).__name__, e)
+            return None
+
+    def autotune_core(
+        self,
+        prepped_glucose: dict,
+        previous_autotune: dict,
+        pumpprofile: dict,
+    ) -> dict | None:
+        import json
+        ffi = self._ffi
+        try:
+            result = self._call_ffi(
+                ffi.ffi_autotune_core,
+                prepped_glucose_json=json.dumps(prepped_glucose),
+                previous_autotune=_build_autotune_profile(ffi, previous_autotune),
+                pump_profile=_build_autotune_profile(ffi, pumpprofile),
+            )
+            if result is None:
+                return None
+            return _autotune_output_to_dict(result)
+        except Exception as e:
+            _logger.warning("FfiRunner.autotune_core failed: %s: %s", type(e).__name__, e)
             return None
 
     def cleanup(self) -> None:

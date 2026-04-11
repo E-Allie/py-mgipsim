@@ -60,6 +60,71 @@ class SubprocessRunner:
                     self._ffi_runner = FfiRunner()
         return self._ffi_runner
 
+    def update_profile(self, profile: dict) -> None:
+        """Notify the FFI session about a profile change (e.g. after autotune)."""
+        if self.use_ffi and self._ffi_runner is not None:
+            self._ffi_runner.update_profile(profile)
+
+    def run_cycle(
+        self,
+        pump_history: list,
+        glucose: list,
+        carb_history: list | None,
+        profile: dict,
+        clock: str,
+        currenttemp: dict,
+        basalprofile: list,
+        microbolus: bool,
+        enable_autosens: bool,
+        enable_meal: bool,
+        isf: dict | None = None,
+    ) -> dict:
+        """Run one full oref0 cycle (iob + meal + autosens + determine_basal).
+
+        When use_ffi=True, uses a persistent Rust session for maximum
+        performance. Otherwise falls back to 4 individual subprocess calls.
+        """
+        if self.use_ffi:
+            return self._ensure_ffi_runner().run_cycle(
+                pump_history, glucose, carb_history, profile, clock,
+                currenttemp, basalprofile, microbolus, enable_autosens, enable_meal,
+            )
+
+        # Individual subprocess fallback
+        iob = self.calculate_iob(pump_history, profile, clock)
+        if iob is None:
+            iob = [{"iob": 0.0, "activity": 0.0, "bolussnooze": 0.0}]
+
+        meal_data = None
+        if enable_meal:
+            meal_data = self.calculate_meal(
+                pump_history, profile, clock, glucose, basalprofile,
+                carb_history or None,
+            )
+
+        autosens_data = None
+        if enable_autosens:
+            if isf is None:
+                isf = dict(profile.get("isfProfile", {}))
+                if "units" not in isf:
+                    isf["units"] = "mg/dL"
+            autosens_result = self.detect_sensitivity(
+                glucose, pump_history, isf, basalprofile, profile,
+                carb_history or None,
+            )
+            autosens_data = autosens_result if autosens_result is not None else {"ratio": 1.0}
+
+        result = self.determine_basal(
+            iob, currenttemp, glucose, profile, clock,
+            meal_data=meal_data, microbolus=microbolus,
+            autosens_data=autosens_data,
+        )
+
+        return {
+            'iob': iob, 'meal': meal_data,
+            'autosens': autosens_data, 'basal': result,
+        }
+
     def _write_json(self, filename: str, data) -> str:
         """Write data as JSON to tmpdir/filename, return full path."""
         path = os.path.join(self.tmpdir, filename)
@@ -99,7 +164,7 @@ class SubprocessRunner:
                 time.perf_counter() - start
             )
 
-    def calculate_iob(self, pump_history: list, profile: dict, clock: str) -> dict | None:
+    def calculate_iob(self, pump_history: list, profile: dict, clock: str) -> list | None:
         """Calculate IOB from pump history.
 
         Args:
@@ -108,8 +173,10 @@ class SubprocessRunner:
             clock: ISO 8601 timestamp string
 
         Returns:
-            IOB dict {"iob": float, "activity": float, "bolussnooze": float}
-            or None on failure
+            Full IOB array (list of dicts) as produced by oref0-calculate-iob.
+            The first element is the current IOB snapshot; subsequent elements
+            are 5-minute projections used by the prediction loop in
+            determine_basal.  Returns None on failure.
         """
         if self.use_ffi:
             return self._ensure_ffi_runner().calculate_iob(pump_history, profile, clock)
@@ -120,19 +187,15 @@ class SubprocessRunner:
         result = self._run_binary("oref0-calculate-iob", [ph_path, profile_path, clock_path])
         if result is None:
             return None
-        # calculate-iob returns an array; we want the first element (current IOB)
         if isinstance(result, list) and len(result) > 0:
-            first = result[0]
-            if isinstance(first, dict):
-                return first
-            return None
-        if isinstance(result, dict):
             return result
+        if isinstance(result, dict):
+            return [result]
         return None
 
     def determine_basal(
         self,
-        iob_data: dict,
+        iob_data: list,
         currenttemp: dict,
         glucose: list,
         profile: dict,
@@ -208,6 +271,10 @@ class SubprocessRunner:
             dict with "mealCOB", "carbs", "reason", etc.
             or None on failure
         """
+        if self.use_ffi:
+            return self._ensure_ffi_runner().calculate_meal(
+                pump_history, profile, clock, glucose, basalprofile, carb_history,
+            )
         ph_path = self._write_json("pumphistory_meal.json", pump_history)
         profile_path = self._write_json("profile_meal.json", profile)
         clock_path = self._write_json("clock_meal.json", clock)
@@ -248,6 +315,10 @@ class SubprocessRunner:
             dict with "ratio" (float), "reason", etc.
             or None on failure
         """
+        if self.use_ffi:
+            return self._ensure_ffi_runner().detect_sensitivity(
+                glucose, pump_history, isf, basalprofile, profile, carb_history,
+            )
         glucose_path = self._write_json("glucose_autosens.json", glucose)
         ph_path = self._write_json("pumphistory_autosens.json", pump_history)
         isf_path = self._write_json("isf.json", isf)
@@ -273,6 +344,10 @@ class SubprocessRunner:
         pumpprofile: dict,
         carb_history: list | None = None,
     ) -> dict | None:
+        if self.use_ffi:
+            return self._ensure_ffi_runner().autotune_prep(
+                pump_history, profile, glucose, pumpprofile, carb_history,
+            )
         ph_path = self._write_json("pumphistory_atprep.json", pump_history)
         profile_path = self._write_json("profile_atprep.json", profile)
         glucose_path = self._write_json("glucose_atprep.json", glucose)
@@ -295,6 +370,10 @@ class SubprocessRunner:
         previous_autotune: dict,
         pumpprofile: dict,
     ) -> dict | None:
+        if self.use_ffi:
+            return self._ensure_ffi_runner().autotune_core(
+                prepped_glucose, previous_autotune, pumpprofile,
+            )
         prepped_path = self._write_json("prepped_glucose.json", prepped_glucose)
         prev_path = self._write_json("previous_autotune.json", previous_autotune)
         pump_path = self._write_json("pumpprofile_atcore.json", pumpprofile)

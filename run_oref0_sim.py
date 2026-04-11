@@ -51,6 +51,9 @@ def parse_args():
     p.add_argument("--use-ffi", dest="use_ffi", action="store_true", default=False,
                    help="Use in-process oref0_ffi wheel instead of subprocess calls. "
                         "Requires the oref0_ffi wheel (maturin develop --release).")
+    p.add_argument("--oref0-config", dest="oref0_config", default=None,
+                   help="TOML config file for oref0 profile overrides. "
+                        "Supports [global] and [patient.N] sections.")
     return p.parse_args()
 
 
@@ -66,6 +69,9 @@ def main():
                 "Install with: cd oref0-rs/crates/oref0-ffi && maturin develop --release"
             ) from e
         os.environ["OREF0_USE_FFI"] = "1"
+
+    if args.oref0_config:
+        os.environ["OREF0_CONFIG_FILE"] = os.path.abspath(args.oref0_config)
 
     os.environ["OREF0_BACKEND"] = args.backend
     if args.oref0_dir:

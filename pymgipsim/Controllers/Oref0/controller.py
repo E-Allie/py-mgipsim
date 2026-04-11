@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -57,8 +59,16 @@ class Controller:
             for _ in range(self.n_patients)
         ]
 
+        from pymgipsim.Controllers.Oref0.oref0_config import load_oref0_config, resolve_overrides
+        config_path = os.environ.get("OREF0_CONFIG_FILE") or None
+        oref0_config = load_oref0_config(config_path) if config_path else None
+
         self.profiles = [
-            ProfileBuilder.build_profile(self.demographic_info, i, enable_smb=enable_smb, enable_uam=enable_uam)
+            ProfileBuilder.build_profile(
+                self.demographic_info, i,
+                enable_smb=enable_smb, enable_uam=enable_uam,
+                overrides=resolve_overrides(oref0_config, i),
+            )
             for i in range(self.n_patients)
         ]
 
@@ -79,9 +89,12 @@ class Controller:
 
         self.debug_log_path = os.environ.get("OREF0_DEBUG_LOG") or None
         self.debug_log_bg_threshold = float(os.environ.get("OREF0_DEBUG_BG", "90"))
+        self._debug_lock = threading.Lock()
         if self.debug_log_path:
             with open(self.debug_log_path, "w") as f:
                 f.write("")
+
+        self._executor = ThreadPoolExecutor(max_workers=max(self.n_patients, 1))
 
     def run(self, measurements, inputs, states, sample: int) -> None:
         # Record glucose at CGM rate (every control_sampling ticks = 5 min).
@@ -106,8 +119,12 @@ class Controller:
             for i in range(self.n_patients):
                 self._run_autotune(i, sample)
 
-        for i in range(self.n_patients):
-            rate_mUmin = self._run_oref0(i, sample, inputs)
+        futures = {
+            i: self._executor.submit(self._run_oref0, i, sample, inputs)
+            for i in range(self.n_patients)
+        }
+        for i, future in futures.items():
+            rate_mUmin = future.result()
             end = min(sample + self.control_sampling, inputs.shape[2])
             inputs[i, 3, sample:end] = rate_mUmin
             self.trackers[i].record_insulin(
@@ -132,48 +149,28 @@ class Controller:
 
         pump_history_json = PumpHistoryBuilder.build_pump_history(tracker.insulin_deliveries)
         clock = tracker.get_clock_json(sample)
-        # Always report no active temp - we directly control the insulin rate
-        # each cycle, so there's no "running temp" to preserve or cancel.
         currenttemp = {"duration": 0, "rate": 0, "temp": "absolute"}
-
-        iob = runner.calculate_iob(pump_history_json, profile, clock)
-        if iob is None:
-            iob = {"iob": 0.0, "activity": 0.0, "bolussnooze": 0.0}
-
-        # Build carb history once if carb forwarding is active (used by meal + autosens)
         carb_history_json = (
             PumpHistoryBuilder.build_carb_history(tracker.carb_events)
             if self.forward_carbs else []
         )
         basalprofile = profile.get("basalprofile", [])
 
-        meal_data = None
-        if self.forward_carbs:
-            meal_data = runner.calculate_meal(
-                pump_history_json, profile, clock, glucose_json, basalprofile, carb_history_json or None
-            )
-
-        autosens_data = None
-        if self.enable_autosens:
-            isf = dict(profile.get("isfProfile", {}))
-            if "units" not in isf:
-                isf["units"] = "mg/dL"
-            autosens_result = runner.detect_sensitivity(
-                glucose_json,
-                pump_history_json,
-                isf,
-                basalprofile,
-                profile,
-                carb_history_json or None,
-            )
-            autosens_data = autosens_result if autosens_result is not None else {"ratio": 1.0}
-
-        result = runner.determine_basal(
-            iob, currenttemp, glucose_json, profile, clock,
-            meal_data=meal_data,
+        cycle = runner.run_cycle(
+            pump_history=pump_history_json,
+            glucose=glucose_json,
+            carb_history=carb_history_json or None,
+            profile=profile,
+            clock=clock,
+            currenttemp=currenttemp,
+            basalprofile=basalprofile,
             microbolus=self.enable_smb,
-            autosens_data=autosens_data,
+            enable_autosens=self.enable_autosens,
+            enable_meal=self.forward_carbs,
         )
+
+        iob = cycle['iob']
+        result = cycle['basal']
         if result is None:
             return self.basal_rates_mUmin[patient_idx]
 
@@ -184,15 +181,16 @@ class Controller:
                     "sample": sample,
                     "patient": patient_idx,
                     "bg": current_bg,
-                    "iob": iob.get("iob", 0.0),
+                    "iob": (iob[0] if isinstance(iob, list) else iob).get("iob", 0.0),
                     "rate": result.get("rate"),
                     "duration": result.get("duration"),
                     "units": result.get("units"),
                     "reason": result.get("reason", ""),
                     "smb_enabled": self.enable_smb,
                 }
-                with open(self.debug_log_path, "a") as f:
-                    f.write(json.dumps(entry) + "\n")
+                with self._debug_lock:
+                    with open(self.debug_log_path, "a") as f:
+                        f.write(json.dumps(entry) + "\n")
 
         if self.enable_smb:
             smb_units = result.get("units")
@@ -251,6 +249,7 @@ class Controller:
 
         self.last_autotune[patient_idx] = result
         self._merge_autotune(patient_idx, result)
+        runner.update_profile(self.profiles[patient_idx])
 
     @staticmethod
     def _profile_to_autotune_shape(profile: dict) -> dict:
@@ -303,5 +302,6 @@ class Controller:
             }
 
     def cleanup(self) -> None:
+        self._executor.shutdown(wait=False)
         for runner in self.runners:
             runner.cleanup()

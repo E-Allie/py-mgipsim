@@ -59,7 +59,7 @@ PROFILE = {
     "bolussnooze_dia_divisor": 2,
 }
 
-IOB_DATA = {"iob": 0, "activity": 0, "bolussnooze": 0}
+IOB_DATA = [{"iob": 0, "activity": 0, "bolussnooze": 0}]
 
 CURRENTTEMP = {"duration": 30, "rate": 1.5, "temp": "absolute"}
 
@@ -164,20 +164,21 @@ def test_determine_basal_has_reason(runner):
 
 
 def test_determine_basal_invalid_input_returns_none(runner):
-    result = runner.determine_basal({}, {}, [], {}, CLOCK)
+    result = runner.determine_basal([], {}, [], {}, CLOCK)
     assert result is None
 
 
-def test_calculate_iob_returns_dict(runner):
+def test_calculate_iob_returns_list(runner):
     result = runner.calculate_iob(PUMP_HISTORY, IOB_PROFILE, IOB_CLOCK)
-    assert isinstance(result, dict)
+    assert isinstance(result, list)
+    assert len(result) > 0
 
 
 def test_calculate_iob_has_iob_field(runner):
     result = runner.calculate_iob(PUMP_HISTORY, IOB_PROFILE, IOB_CLOCK)
     assert result is not None
-    assert "iob" in result
-    assert isinstance(result["iob"], (int, float))
+    assert "iob" in result[0]
+    assert isinstance(result[0]["iob"], (int, float))
 
 
 def test_cleanup_removes_tmpdir(runner):

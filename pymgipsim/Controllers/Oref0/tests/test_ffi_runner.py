@@ -71,7 +71,7 @@ PROFILE = {
     "bolussnooze_dia_divisor": 2,
 }
 
-IOB_DATA = {"iob": 0, "activity": 0, "bolussnooze": 0}
+IOB_DATA = [{"iob": 0, "activity": 0, "bolussnooze": 0}]
 CURRENTTEMP = {"duration": 30, "rate": 1.5, "temp": "absolute"}
 CLOCK = "2026-01-01T00:05:00Z"
 
@@ -148,13 +148,14 @@ def test_ffi_runner_initializes():
 
 
 @skip_no_wheel
-def test_ffi_runner_calculate_iob_returns_dict():
+def test_ffi_runner_calculate_iob_returns_list():
     from pymgipsim.Controllers.Oref0.ffi_runner import FfiRunner
     runner = FfiRunner()
     result = runner.calculate_iob(PUMP_HISTORY, IOB_PROFILE, IOB_CLOCK)
-    assert isinstance(result, dict)
-    assert "iob" in result
-    assert "activity" in result
+    assert isinstance(result, list)
+    assert len(result) > 0
+    assert "iob" in result[0]
+    assert "activity" in result[0]
 
 
 @skip_no_wheel
@@ -177,7 +178,7 @@ def test_calculate_iob_parity_with_subprocess():
         sub_result = sub_runner.calculate_iob(PUMP_HISTORY, IOB_PROFILE, IOB_CLOCK)
         assert ffi_result is not None
         assert sub_result is not None
-        mismatches = _dicts_equal(ffi_result, sub_result, ["iob", "activity", "basaliob", "bolusiob"])
+        mismatches = _dicts_equal(ffi_result[0], sub_result[0], ["iob", "activity", "basaliob", "bolusiob"])
         assert mismatches == [], "IOB parity failed:\n" + "\n".join(mismatches)
     finally:
         sub_runner.cleanup()
@@ -197,9 +198,9 @@ def test_determine_basal_parity_with_subprocess():
         iob_ffi = ffi_runner.calculate_iob([], IOB_PROFILE, clock)
         iob_sub = sub_runner.calculate_iob([], IOB_PROFILE, clock)
         if iob_ffi is None:
-            iob_ffi = {"iob": 0.0, "activity": 0.0}
+            iob_ffi = [{"iob": 0.0, "activity": 0.0}]
         if iob_sub is None:
-            iob_sub = {"iob": 0.0, "activity": 0.0}
+            iob_sub = [{"iob": 0.0, "activity": 0.0}]
 
         ffi_result = ffi_runner.determine_basal(
             iob_ffi, CURRENTTEMP, glucose, PROFILE, clock

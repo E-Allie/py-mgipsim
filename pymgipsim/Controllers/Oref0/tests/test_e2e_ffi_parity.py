@@ -104,7 +104,7 @@ def _run_steps(runner, n_steps=24):
 
         iob = runner.calculate_iob(pump_history, PROFILE, clock)
         if iob is None:
-            iob = {"iob": 0.0, "activity": 0.0}
+            iob = [{"iob": 0.0, "activity": 0.0}]
 
         result = runner.determine_basal(
             iob, currenttemp, glucose_json, PROFILE, clock

@@ -5,7 +5,8 @@ class ProfileBuilder:
     """Builds oref0-compatible profile dict from demographic_info."""
 
     @staticmethod
-    def build_profile(demographic_info, patient_idx: int, *, enable_smb: bool = False, enable_uam: bool = False) -> dict:
+    def build_profile(demographic_info, patient_idx: int, *, enable_smb: bool = False, enable_uam: bool = False,
+                      overrides: dict | None = None) -> dict:
         basal = demographic_info.basal[patient_idx]
         carb_ratio = demographic_info.carb_insulin_ratio[patient_idx]
         sens = demographic_info.correction_bolus[patient_idx]
@@ -31,7 +32,7 @@ class ProfileBuilder:
             ]
         }
 
-        return {
+        profile = {
             "sens": sens,
             "carb_ratio": carb_ratio,
             "current_basal": basal,
@@ -85,3 +86,17 @@ class ProfileBuilder:
             "suspend_zeros_iob": True,
             "bolussnooze_dia_divisor": 2,
         }
+
+        if overrides:
+            profile.update(overrides)
+            if any(k in overrides for k in ("min_bg", "max_bg")):
+                profile["bg_targets"]["targets"][0]["low"] = profile["min_bg"]
+                profile["bg_targets"]["targets"][0]["high"] = profile["max_bg"]
+            if "sens" in overrides:
+                profile["isfProfile"]["sensitivities"][0]["sensitivity"] = profile["sens"]
+            if "carb_ratio" in overrides:
+                profile["carb_ratios"]["schedule"][0]["ratio"] = profile["carb_ratio"]
+            if "dia" in overrides:
+                profile["pump_settings"]["insulin_action_curve"] = profile["dia"]
+
+        return profile

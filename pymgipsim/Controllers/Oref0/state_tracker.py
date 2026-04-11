@@ -32,7 +32,9 @@ class StateTracker:
         # Since epoch_ms = now, sample 0 = now, sample N = now + N minutes.
         # oref0 only checks if glucose is too OLD (not too new), so future timestamps
         # are treated as age=0 (always fresh).
-        self.epoch_ms: int = int(time.time() * 1000)
+        # Fixed epoch for deterministic timestamps across runs.
+        # Original: int(time.time() * 1000)
+        self.epoch_ms: int = 1700000000000  # 2023-11-14T22:13:20Z
         # deque of (epoch_ms: int, sgv_mgdl: float) - newest appended last
         self.glucose_history: deque = deque(maxlen=glucose_maxlen)
         # list of dicts: {timestamp_str, rate_Uhr, duration_min}
