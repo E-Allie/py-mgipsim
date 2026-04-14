@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 
+from datetime import datetime, timezone
 from functools import lru_cache
 
 @lru_cache(maxsize=1)
@@ -18,22 +19,29 @@ def _find_node() -> str:
     return "node"
 
 
-class SubprocessRunner:
-    """Calls oref0 CLI binaries via subprocess.
+@lru_cache(maxsize=1)
+def _find_libfaketime() -> str | None:
+    path = os.environ.get("LIBFAKETIME_PATH")
+    if path and os.path.isfile(path):
+        return path
+    ft = shutil.which("faketime")
+    if ft:
+        lib_dir = os.path.join(os.path.dirname(os.path.dirname(ft)), "lib")
+        for name in ("libfaketime.so.1", "libfaketime.so"):
+            p = os.path.join(lib_dir, name)
+            if os.path.isfile(p):
+                return p
+    return None
 
-    Manages a temp directory for JSON staging files.
-    All calls have a 10-second timeout.
-    On any failure (non-zero exit, timeout, parse error), returns None.
-    """
+
+class SubprocessRunner:
+    """Runs oref0 CLI binaries via subprocess (or FFI). Returns None on any failure."""
 
     def __init__(self, backend: str = "rust", oref0_path: Path | None = None,
                  use_ffi: bool = False):
         self.backend = backend
         self.use_ffi = use_ffi
         self._ffi_runner = None
-        # Per-instance lock guarding lazy FfiRunner instantiation. Prevents
-        # duplicate FfiRunner creation if multiple threads share a
-        # SubprocessRunner instance (e.g. future parallel patient simulation).
         self._ffi_runner_lock = threading.Lock()
         if oref0_path is not None:
             self.oref0_path = Path(oref0_path)
@@ -48,11 +56,10 @@ class SubprocessRunner:
         os.makedirs(os.path.join(self.tmpdir, "autotune"), exist_ok=True)
 
         self.subprocess_seconds: dict[str, list[float]] = {}
+        self._faketime_lib = _find_libfaketime()
+        self._sim_clock: str | None = None
 
     def _ensure_ffi_runner(self):
-        # Double-checked locking: fast path avoids lock acquisition once
-        # the runner is initialized, slow path serializes concurrent first
-        # callers so only one FfiRunner is ever created per instance.
         if self._ffi_runner is None:
             with self._ffi_runner_lock:
                 if self._ffi_runner is None:
@@ -61,7 +68,6 @@ class SubprocessRunner:
         return self._ffi_runner
 
     def update_profile(self, profile: dict) -> None:
-        """Notify the FFI session about a profile change (e.g. after autotune)."""
         if self.use_ffi and self._ffi_runner is not None:
             self._ffi_runner.update_profile(profile)
 
@@ -79,16 +85,15 @@ class SubprocessRunner:
         enable_meal: bool,
         isf: dict | None = None,
     ) -> dict:
-        """Run one full oref0 cycle (iob + meal + autosens + determine_basal).
-
-        When use_ffi=True, uses a persistent Rust session for maximum
-        performance. Otherwise falls back to 4 individual subprocess calls.
-        """
+        """Run one full oref0 cycle (iob + meal + autosens + determine_basal)."""
         if self.use_ffi:
             return self._ensure_ffi_runner().run_cycle(
                 pump_history, glucose, carb_history, profile, clock,
                 currenttemp, basalprofile, microbolus, enable_autosens, enable_meal,
             )
+
+        # Pin wall-clock for all subprocess calls in this cycle
+        self._sim_clock = clock
 
         # Individual subprocess fallback
         iob = self.calculate_iob(pump_history, profile, clock)
@@ -126,14 +131,12 @@ class SubprocessRunner:
         }
 
     def _write_json(self, filename: str, data) -> str:
-        """Write data as JSON to tmpdir/filename, return full path."""
         path = os.path.join(self.tmpdir, filename)
         with open(path, "w") as f:
             json.dump(data, f)
         return path
 
     def _run_binary(self, binary_name: str, args: list[str]) -> dict | list | None:
-        """Run a binary with args, return parsed JSON stdout or None on failure."""
         # Both backends run from tmpdir so autotune/ directory is found by
         # determine-basal (fs.existsSync("autotune") / Path::new("autotune").exists()).
         cwd = self.tmpdir
@@ -145,6 +148,14 @@ class SubprocessRunner:
             bare_args = [os.path.basename(a) if a.startswith(self.tmpdir) else a
                          for a in args]
             cmd = [_find_node(), str(self.oref0_path / f"{binary_name}.js")] + bare_args
+        env = None
+        if self._faketime_lib and self._sim_clock:
+            utc_dt = datetime.fromisoformat(self._sim_clock.replace("Z", "+00:00"))
+            local_dt = utc_dt.astimezone()
+            env = os.environ.copy()
+            env["LD_PRELOAD"] = self._faketime_lib
+            env["FAKETIME"] = local_dt.strftime("%Y-%m-%d %H:%M:%S")
+
         start = time.perf_counter()
         try:
             result = subprocess.run(
@@ -153,10 +164,12 @@ class SubprocessRunner:
                 text=True,
                 timeout=10,
                 cwd=cwd,
+                env=env,
             )
             if result.returncode != 0:
                 return None
-            return json.loads(result.stdout)
+            parsed = json.loads(result.stdout)
+            return parsed
         except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError, OSError):
             return None
         finally:
@@ -165,21 +178,11 @@ class SubprocessRunner:
             )
 
     def calculate_iob(self, pump_history: list, profile: dict, clock: str) -> list | None:
-        """Calculate IOB from pump history.
-
-        Args:
-            pump_history: list of pump history entries
-            profile: oref0 profile dict
-            clock: ISO 8601 timestamp string
-
-        Returns:
-            Full IOB array (list of dicts) as produced by oref0-calculate-iob.
-            The first element is the current IOB snapshot; subsequent elements
-            are 5-minute projections used by the prediction loop in
-            determine_basal.  Returns None on failure.
-        """
+        """Run oref0-calculate-iob. Returns the full IOB array (current snapshot
+        + 5-min projections for determine_basal), or None on failure."""
         if self.use_ffi:
             return self._ensure_ffi_runner().calculate_iob(pump_history, profile, clock)
+        self._sim_clock = clock
         ph_path = self._write_json("pumphistory.json", pump_history)
         profile_path = self._write_json("profile.json", profile)
         clock_path = self._write_json("clock.json", clock)
@@ -204,27 +207,13 @@ class SubprocessRunner:
         microbolus: bool = False,
         autosens_data: dict | None = None,
     ) -> dict | None:
-        """Determine temp basal rate.
-
-        Args:
-            iob_data: IOB dict from calculate_iob
-            currenttemp: current temp basal dict
-            glucose: list of glucose entries (newest first)
-            profile: oref0 profile dict
-            clock: ISO 8601 timestamp string (used as --currentTime)
-            meal_data: optional meal data dict
-            microbolus: enable SMB microboluses (requires autotune/ in CWD)
-            autosens_data: optional autosens ratio dict
-
-        Returns:
-            dict with "rate" (U/hr), "duration", "reason", etc.
-            or None on failure
-        """
+        """Run oref0-determine-basal. Returns dict with rate/duration/reason, or None on failure."""
         if self.use_ffi:
             return self._ensure_ffi_runner().determine_basal(
                 iob_data, currenttemp, glucose, profile, clock,
                 meal_data=meal_data, microbolus=microbolus, autosens_data=autosens_data,
             )
+        self._sim_clock = clock
         iob_path = self._write_json("iob.json", iob_data)
         temp_path = self._write_json("currenttemp.json", currenttemp)
         glucose_path = self._write_json("glucose.json", glucose)
@@ -257,24 +246,12 @@ class SubprocessRunner:
         basalprofile: list,
         carb_history: list | None = None,
     ) -> dict | None:
-        """Calculate meal data (COB, carbs).
-
-        Args:
-            pump_history: list of pump history entries
-            profile: oref0 profile dict
-            clock: ISO 8601 timestamp string
-            glucose: list of glucose entries
-            basalprofile: list of basal profile entries
-            carb_history: optional list of carb entries
-
-        Returns:
-            dict with "mealCOB", "carbs", "reason", etc.
-            or None on failure
-        """
+        """Run oref0-meal. Returns dict with mealCOB/carbs/reason, or None on failure."""
         if self.use_ffi:
             return self._ensure_ffi_runner().calculate_meal(
                 pump_history, profile, clock, glucose, basalprofile, carb_history,
             )
+        self._sim_clock = clock
         ph_path = self._write_json("pumphistory_meal.json", pump_history)
         profile_path = self._write_json("profile_meal.json", profile)
         clock_path = self._write_json("clock_meal.json", clock)
@@ -301,20 +278,7 @@ class SubprocessRunner:
         profile: dict,
         carb_history: list | None = None,
     ) -> dict | None:
-        """Detect insulin sensitivity (autosens ratio).
-
-        Args:
-            glucose: list of glucose entries (newest first)
-            pump_history: list of pump history entries
-            isf: dict with "units" and "sensitivities" [{"sensitivity": value}]
-            basalprofile: list of basal profile entries
-            profile: oref0 profile dict
-            carb_history: optional list of carb entries
-
-        Returns:
-            dict with "ratio" (float), "reason", etc.
-            or None on failure
-        """
+        """Run oref0-detect-sensitivity. Returns dict with ratio, or None on failure."""
         if self.use_ffi:
             return self._ensure_ffi_runner().detect_sensitivity(
                 glucose, pump_history, isf, basalprofile, profile, carb_history,
@@ -330,6 +294,12 @@ class SubprocessRunner:
         if carb_history is not None:
             carb_path = self._write_json("carbhistory_autosens.json", carb_history)
             args.append(carb_path)
+        else:
+            # Placeholder so "retrospective" lands in the temptargets slot (arg 7)
+            args.append(self._write_json("carbhistory_autosens.json", []))
+
+        # Retrospective mode: deterministic (no wall-clock dependency).
+        args.append("retrospective")
 
         result = self._run_binary("oref0-detect-sensitivity", args)
         if isinstance(result, dict):

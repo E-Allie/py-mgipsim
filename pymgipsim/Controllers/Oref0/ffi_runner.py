@@ -30,21 +30,12 @@ def _get_ffi():
             ]
             missing = [f for f in required if not hasattr(oref0_ffi, f)]
             if missing:
-                raise RuntimeError(
-                    f"oref0_ffi wheel is missing: {missing}. "
-                    f"Rebuild with: cd oref0-rs/crates/oref0-ffi && maturin develop --release"
-                )
+                raise RuntimeError(f"oref0_ffi wheel is missing: {missing}")
             _oref0_ffi = oref0_ffi
         except ImportError as e:
-            raise RuntimeError(
-                "use_ffi=True requires the oref0_ffi wheel to be installed. "
-                "Install with: cd oref0-rs/crates/oref0-ffi && maturin develop --release"
-            ) from e
+            raise RuntimeError("use_ffi=True but oref0_ffi wheel is not installed") from e
         except (OSError, AttributeError) as e:
-            raise RuntimeError(
-                f"oref0_ffi wheel appears installed but is broken: {type(e).__name__}: {e}. "
-                "Rebuild with: cd oref0-rs/crates/oref0-ffi && maturin develop --release"
-            ) from e
+            raise RuntimeError(f"oref0_ffi wheel is broken: {e}") from e
     return _oref0_ffi
 
 
@@ -59,71 +50,23 @@ def _opt_int(v: Any) -> int | None:
     return None if v is None else int(v)
 
 
-def _get_last_glucose(glucose_list: list) -> dict | None:
-    """Port of js/lib/glucose-get-last.js - must stay byte-compatible with the JS oracle."""
-    data = []
-    for obj in glucose_list:
-        g = obj.get("glucose") or obj.get("sgv")
-        if g:
-            entry = dict(obj)
-            entry["glucose"] = g
-            data.append(entry)
-
-    if not data:
+def _ffi_get_last_glucose(ffi, glucose_list: list) -> dict | None:
+    entries = [_build_glucose_entry(ffi, e) for e in glucose_list]
+    result = ffi.ffi_get_last_glucose(entries)
+    if result is None:
         return None
-
-    now = data[0]
-    now_glucose = float(now["glucose"])
-    now_date = float(now.get("date") or 0)
-
-    last_deltas: list[float] = []
-    short_deltas: list[float] = []
-    long_deltas: list[float] = []
-
-    for i in range(1, len(data)):
-        entry = data[i]
-        if entry.get("type") == "cal":
-            break
-        g = float(entry.get("glucose") or entry.get("sgv") or 0)
-        if g <= 38:
-            continue
-        if entry.get("device") != now.get("device"):
-            continue
-
-        then_date = float(entry.get("date") or 0)
-        if now_date == 0 or then_date == 0:
-            continue
-
-        minutesago = round((now_date - then_date) / (1000 * 60))
-        if minutesago == 0:
-            continue
-
-        change = now_glucose - g
-        avgdelta = change / minutesago * 5
-
-        if -2 < minutesago < 2.5:
-            now_glucose = (now_glucose + g) / 2
-            now_date = (now_date + then_date) / 2
-        elif 2.5 < minutesago < 17.5:
-            short_deltas.append(avgdelta)
-            if 2.5 < minutesago < 7.5:
-                last_deltas.append(avgdelta)
-        elif 17.5 < minutesago < 42.5:
-            long_deltas.append(avgdelta)
-
-    last_delta = sum(last_deltas) / len(last_deltas) if last_deltas else 0.0
-    short_avgdelta = sum(short_deltas) / len(short_deltas) if short_deltas else 0.0
-    long_avgdelta = sum(long_deltas) / len(long_deltas) if long_deltas else 0.0
-
-    return {
-        "glucose": round(now_glucose * 100) / 100,
-        "date": int(now_date),
-        "delta": round(last_delta * 100) / 100,
-        "short_avgdelta": round(short_avgdelta * 100) / 100,
-        "long_avgdelta": round(long_avgdelta * 100) / 100,
-        "noise": now.get("noise"),
-        "device": now.get("device"),
+    d: dict = {
+        "glucose": result.glucose,
+        "date": result.date,
+        "delta": result.delta,
+        "short_avgdelta": result.short_avgdelta,
+        "long_avgdelta": result.long_avgdelta,
     }
+    if result.noise is not None:
+        d["noise"] = result.noise
+    if result.device is not None:
+        d["device"] = result.device
+    return d
 
 
 def _build_glucose_status(ffi, gs: dict):
@@ -647,7 +590,6 @@ def _autotune_output_to_dict(result) -> dict:
 
 
 class FfiRunner:
-    """Drop-in for SubprocessRunner using in-process oref0_ffi calls instead of subprocesses."""
 
     def __init__(self):
         self._ffi = _get_ffi()
@@ -655,14 +597,11 @@ class FfiRunner:
         self._pushed_history_len: int = 0
         self._glucose_initialized: bool = False
         self._glucose_maxlen: int = 288
-        # Cache fd descriptors for stderr suppression (Rust eprintln! writes
-        # to fd 2 directly). Saves 4 syscalls per cycle vs opening/closing
-        # each time.
+        # Cached fds for suppressing Rust eprintln! during FFI calls.
         self._devnull_fd: int = os.open(os.devnull, os.O_WRONLY)
         self._real_fd2: int = os.dup(2)
 
     def update_profile(self, profile: dict) -> None:
-        """Push an updated profile to the session (e.g. after autotune)."""
         if self._session is not None:
             self._session.update_profile(_build_profile(self._ffi, profile))
 
@@ -679,10 +618,6 @@ class FfiRunner:
         enable_autosens: bool,
         enable_meal: bool,
     ) -> dict:
-        """Run one full oref0 cycle via the Rust session object.
-
-        Returns dict with 'iob', 'meal', 'autosens', 'basal' keys.
-        """
         ffi = self._ffi
 
         if self._session is None:
@@ -691,9 +626,7 @@ class FfiRunner:
                 _build_basal_entries(ffi, basalprofile),
             )
 
-        # build_pump_history reverses to newest-first, so new events appear
-        # at the front. Push only those (~2-3 per cycle); the session
-        # prepends them to maintain newest-first order.
+        # Push only new events (pump_history is newest-first).
         new_count = len(pump_history) - self._pushed_history_len
         if new_count > 0:
             self._session.push_pump_events(
@@ -701,8 +634,7 @@ class FfiRunner:
             )
             self._pushed_history_len = len(pump_history)
 
-        # Incremental glucose: first call does full set_glucose (warmup data),
-        # then each subsequent cycle pushes only the 1 new reading at front.
+        # First call sends full history; subsequent calls push 1 new reading.
         if self._glucose_initialized:
             if glucose:
                 self._session.push_glucose(
@@ -714,15 +646,16 @@ class FfiRunner:
             )
             self._glucose_initialized = True
 
-        # Carb history (small list, full replace is fine)
+        # Carb history: small list, full replace each cycle.
         if carb_history:
             self._session.set_carb_history(
                 [_build_carb_entry(ffi, e) for e in carb_history]
             )
 
-        # Suppress Rust eprintln! output (fd 2) during the FFI call.
-        # Cached fds avoid 4 syscalls/cycle vs the context-manager approach.
-        os.dup2(self._devnull_fd, 2)
+        # Suppress Rust eprintln! during the call.
+        suppress = self._devnull_fd >= 0 and self._real_fd2 >= 0
+        if suppress:
+            os.dup2(self._devnull_fd, 2)
         try:
             result = self._session.run_cycle(
                 clock=clock,
@@ -732,7 +665,8 @@ class FfiRunner:
                 run_meal=enable_meal,
             )
         finally:
-            os.dup2(self._real_fd2, 2)
+            if suppress:
+                os.dup2(self._real_fd2, 2)
 
         return {
             'iob': _iob_entry_to_dict(result.iob) if result.iob else {
@@ -744,12 +678,14 @@ class FfiRunner:
         }
 
     def _call_ffi(self, fn, **kwargs):
-        """Call an FFI function with stderr suppressed via cached fd descriptors."""
-        os.dup2(self._devnull_fd, 2)
+        suppress = self._devnull_fd >= 0 and self._real_fd2 >= 0
+        if suppress:
+            os.dup2(self._devnull_fd, 2)
         try:
             return fn(**kwargs)
         finally:
-            os.dup2(self._real_fd2, 2)
+            if suppress:
+                os.dup2(self._real_fd2, 2)
 
     def calculate_iob(
         self,
@@ -781,7 +717,7 @@ class FfiRunner:
     ) -> dict | None:
         ffi = self._ffi
         try:
-            gs_dict = _get_last_glucose(glucose)
+            gs_dict = _ffi_get_last_glucose(ffi, glucose)
             if gs_dict is None:
                 return None
 
@@ -838,14 +774,15 @@ class FfiRunner:
     ) -> dict | None:
         ffi = self._ffi
         try:
+            clock = glucose[0].get("dateString", "") if glucose else ""
             result = self._call_ffi(
                 ffi.ffi_detect_sensitivity,
                 glucose=[_build_glucose_entry(ffi, e) for e in glucose],
-                history_inputs=_build_history_inputs(ffi, pump_history, profile, ""),
+                history_inputs=_build_history_inputs(ffi, pump_history, profile, clock),
                 basalprofile=_build_basal_entries(ffi, basalprofile),
                 carbs=[_build_carb_entry(ffi, e) for e in (carb_history or [])],
                 temptargets=[],
-                retrospective=False,
+                retrospective=True,
                 deviations=None,
             )
             if result is None:
@@ -904,4 +841,12 @@ class FfiRunner:
             return None
 
     def cleanup(self) -> None:
-        pass
+        if self._devnull_fd >= 0:
+            os.close(self._devnull_fd)
+            self._devnull_fd = -1
+        if self._real_fd2 >= 0:
+            os.close(self._real_fd2)
+            self._real_fd2 = -1
+
+    def __del__(self):
+        self.cleanup()

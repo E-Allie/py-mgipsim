@@ -72,9 +72,7 @@ class Controller:
             for i in range(self.n_patients)
         ]
 
-        # Immutable pump profiles for autotune (the "ground truth" starting point)
-        self.pump_profiles = [dict(p) for p in self.profiles]
-        # Previous autotune output per patient (None = first run, use pump profile)
+        self.pump_profiles = [dict(p) for p in self.profiles]  # autotune baseline
         self.last_autotune: list[dict | None] = [None] * self.n_patients
 
         self.runners = [
@@ -97,9 +95,7 @@ class Controller:
         self._executor = ThreadPoolExecutor(max_workers=max(self.n_patients, 1))
 
     def run(self, measurements, inputs, states, sample: int) -> None:
-        # Record glucose at CGM rate (every control_sampling ticks = 5 min).
-        # oref0's get_last_glucose averages entries < 2.5 min apart, which
-        # drags the "now" timestamp backward when fed 1-min data.
+        # Only feed glucose every 5 min -- oref0 averages entries < 2.5 min apart.
         if sample % self.control_sampling == 0:
             for i in range(self.n_patients):
                 self.trackers[i].record_glucose(sample, float(measurements[i]))
@@ -196,14 +192,12 @@ class Controller:
             smb_units = result.get("units")
             if smb_units and float(smb_units) > 0:
                 smb_u = float(smb_units)
-                # Record SMB as a Bolus event in pump history for correct IOB accounting
                 tracker.insulin_deliveries.append({
                     "timestamp_str": tracker.get_clock_json(sample),
                     "_type": "Bolus",
                     "amount_Uhr": smb_u,
                     "duration_min": 0.0,
                 })
-                # Add SMB to the basal rate for this window (convert U to mU/min over 5 min)
                 smb_mUmin = (smb_u * 1000.0) / (self.control_sampling * self.sampling_time)
                 rate_Uhr = result.get("rate")
                 if rate_Uhr is None:

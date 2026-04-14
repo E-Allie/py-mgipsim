@@ -1,8 +1,4 @@
-"""Accumulates glucose/insulin/carb history for one patient.
-
-All timestamps are anchored to wall-clock time so that oref0's staleness
-check (Date.now()) always sees glucose as fresh data.
-"""
+"""Per-patient glucose/insulin/carb history for oref0."""
 
 from __future__ import annotations
 
@@ -14,7 +10,6 @@ from pymgipsim.Controllers.Oref0.unit_bridge import UnitBridge
 
 
 def _ms_to_iso(ms: int) -> str:
-    """Convert epoch milliseconds to ISO 8601 UTC string."""
     dt = datetime.datetime.fromtimestamp(ms / 1000.0, tz=datetime.timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -26,15 +21,10 @@ class StateTracker:
         glucose_maxlen: max glucose readings to retain (48=4h, 288=24h).
         """
         self.sampling_time = sampling_time
-        # Anchor epoch to wall clock so glucose timestamps are always fresh to oref0.
-        # epoch_ms is the wall-clock time corresponding to simulation sample 0.
-        # Sample N will have timestamp epoch_ms + N * sampling_time * 60 * 1000.
-        # Since epoch_ms = now, sample 0 = now, sample N = now + N minutes.
-        # oref0 only checks if glucose is too OLD (not too new), so future timestamps
-        # are treated as age=0 (always fresh).
-        # Fixed epoch for deterministic timestamps across runs.
-        # Original: int(time.time() * 1000)
-        self.epoch_ms: int = 1700000000000  # 2023-11-14T22:13:20Z
+        # Fixed epoch so timestamps are deterministic across runs.
+        # oref0 rejects glucose it considers stale (vs wall clock), so this
+        # must not fall too far behind real time.
+        self.epoch_ms: int = 1775952000000  # 2026-04-12T00:00:00Z
         # deque of (epoch_ms: int, sgv_mgdl: float) - newest appended last
         self.glucose_history: deque = deque(maxlen=glucose_maxlen)
         # list of dicts: {timestamp_str, rate_Uhr, duration_min}
@@ -51,7 +41,6 @@ class StateTracker:
         return _ms_to_iso(self._sample_to_ms(sample))
 
     def record_glucose(self, sample: int, glucose_mmol: float) -> None:
-        """Record a glucose reading (in mmol/L) at the given sample index."""
         ms = self._sample_to_ms(sample)
         mgdl = UnitBridge.mmol_to_mgdl(glucose_mmol)
         self.glucose_history.append((ms, mgdl))
@@ -59,7 +48,6 @@ class StateTracker:
     def record_insulin(
         self, sample: int, rate_mUmin: float, duration_min: float = 5.0
     ) -> None:
-        """Record an insulin delivery (in mU/min) at the given sample index."""
         rate_Uhr = UnitBridge.mUmin_to_Uhr(rate_mUmin)
         ts = self._sample_to_iso(sample)
         self.insulin_deliveries.append(
@@ -76,17 +64,11 @@ class StateTracker:
         }
 
     def record_carbs(self, sample: int, carbs_g: float) -> None:
-        """Record a carb event (in grams) at the given sample index."""
         ts = self._sample_to_iso(sample)
         self.carb_events.append({"timestamp_str": ts, "amount_g": carbs_g})
 
     def get_glucose_json(self) -> list:
-        """Return glucose history as oref0-compatible JSON array (newest first).
-
-        Each entry: {"date": epoch_ms, "dateString": iso_str, "sgv": mg_dl,
-                     "glucose": mg_dl, "direction": "Flat", "type": "sgv",
-                     "device": "fakecgm"}
-        """
+        """Glucose history as oref0 JSON (newest first), direction always "Flat"."""
         result = []
         history = list(self.glucose_history)  # oldest first
         for ms, mgdl in history:
@@ -105,11 +87,7 @@ class StateTracker:
         return result
 
     def get_pump_history_json(self) -> list:
-        """Return pump history as oref0-compatible JSON array, newest-first.
-
-        See PumpHistoryBuilder.build_pump_history for the newest-first ordering
-        rationale.
-        """
+        """Pump history as oref0 JSON, newest-first."""
         result = []
         for delivery in self.insulin_deliveries:
             if delivery.get("_type") == "Bolus":
@@ -147,20 +125,7 @@ class StateTracker:
 
     @staticmethod
     def integrate_carbs(inputs_row, sample: int, control_sampling: int, sampling_time: float) -> float:
-        """Integrate carb rate over one control window and return total grams.
-
-        Sums fast carbs (channel 0) and slow carbs (channel 1) from the
-        py-mgipsim inputs array over the control window, converts mmol to grams.
-
-        Args:
-            inputs_row: inputs[patient_idx] - shape [n_channels, n_samples]
-            sample: current sample index (start of control window)
-            control_sampling: number of samples per control cycle (e.g. 5)
-            sampling_time: minutes per sample (e.g. 1.0)
-
-        Returns:
-            Total carbs in grams for this window. 0.0 if none.
-        """
+        """Sum fast+slow carb channels over one control window, return grams."""
         end = sample + control_sampling
         fast = inputs_row[0, sample:end]
         slow = inputs_row[1, sample:end]

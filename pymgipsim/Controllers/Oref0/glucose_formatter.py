@@ -3,17 +3,7 @@ from pymgipsim.Controllers.Oref0.state_tracker import _ms_to_iso
 
 
 def _classify_direction(delta_mgdl_per_min: float) -> str:
-    """Classify glucose trend direction from 5-minute delta (mg/dL).
-
-    Thresholds (standard CGM conventions):
-    - DoubleUp:      delta >= 3.0 mg/dL/min  (>= 15 mg/dL per 5 min)
-    - SingleUp:      delta >= 2.0             (>= 10 mg/dL per 5 min)
-    - FortyFiveUp:   delta >= 1.0             (>= 5 mg/dL per 5 min)
-    - Flat:          -1.0 < delta < 1.0       (-5 to +5 mg/dL per 5 min)
-    - FortyFiveDown: delta <= -1.0            (<= -5 mg/dL per 5 min)
-    - SingleDown:    delta <= -2.0            (<= -10 mg/dL per 5 min)
-    - DoubleDown:    delta <= -3.0            (<= -15 mg/dL per 5 min)
-    """
+    """CGM trend arrow from mg/dL-per-minute delta."""
     if delta_mgdl_per_min >= 3.0:
         return "DoubleUp"
     elif delta_mgdl_per_min >= 2.0:
@@ -31,21 +21,10 @@ def _classify_direction(delta_mgdl_per_min: float) -> str:
 
 
 class GlucoseFormatter:
-    """Formats StateTracker glucose history into oref0 glucose.json format."""
 
     @staticmethod
     def format(glucose_history_tuples: list) -> list:
-        """Format glucose history as oref0-compatible JSON array (newest first).
-
-        Args:
-            glucose_history_tuples: list of (epoch_ms: int, sgv_mgdl: float)
-                                    in OLDEST-FIRST order (as stored in StateTracker.glucose_history)
-
-        Returns:
-            list of dicts, newest first, each with:
-            {"date": epoch_ms, "dateString": iso_str, "sgv": mg_dl,
-             "glucose": mg_dl, "direction": str, "type": "sgv", "device": "fakecgm"}
-        """
+        """Convert (epoch_ms, mgdl) tuples (oldest-first) to oref0 glucose JSON (newest-first)."""
         if not glucose_history_tuples:
             return []
 
@@ -53,7 +32,6 @@ class GlucoseFormatter:
         history = list(glucose_history_tuples)  # oldest first
 
         for i, (ms, mgdl) in enumerate(history):
-            # Compute direction from delta to previous reading
             if i == 0:
                 direction = "Flat"
             else:

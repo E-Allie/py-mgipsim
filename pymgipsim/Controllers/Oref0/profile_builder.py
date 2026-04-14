@@ -1,8 +1,4 @@
-"""Maps py-mgipsim demographic_info to oref0 profile format."""
-
-
 class ProfileBuilder:
-    """Builds oref0-compatible profile dict from demographic_info."""
 
     @staticmethod
     def build_profile(demographic_info, patient_idx: int, *, enable_smb: bool = False, enable_uam: bool = False,
